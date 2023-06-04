@@ -23,6 +23,7 @@ Then you can run the file `main.py` to train the model. The model hyperparameter
 - PyTorch > 1.10
 - numpy > 1.20
 - pandas > 1.3
+- tensorflow == 2.7.0
 - math
 
 ## Citation
