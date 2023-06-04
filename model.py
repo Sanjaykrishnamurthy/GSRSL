@@ -6,12 +6,14 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
 # hyperparameters
 batch_size = 32 
 window_size = 30
+max_len = 25
 learning_rate = 0.0001
-epochs = 70
+epochs = 1
 embed_dim = 60
 n_head = 1
 n_layer = 1
@@ -28,7 +30,6 @@ inpf = df.groupby(['session_id'])['price'].apply(list)
 
 vocab = df['item_id'].nunique()+5
 vocab_cat = df['category_id'].nunique()+5
-
 
 def seq_to_window(arr, window_size):
     """Converts variable length item sequence to fixed size and splits into train and test.
@@ -51,9 +52,24 @@ def seq_to_window(arr, window_size):
     return seq, pos, test
 
 
+def seq_to_window_features(arr, window_size):
+    """Converts variable length category sequence to fixed size.  """
+    seq = []
+    for i, row in enumerate(arr):
+        if (len(row) <= window_size) and (len(row) > 2):
+            seq.append(row[:-2])
+    return seq
+
 seq, pos, test = seq_to_window(inp.values.tolist(), window_size=window_size)
+seqc = seq_to_window_features(inpc.values.tolist(), window_size=window_size)
+seqn = seq_to_window_features(inpf.values.tolist(), window_size=window_size)
+
 seq = pad_sequences(seq, value=0, maxlen=window_size-1, dtype='int32')
 pos = pad_sequences(pos, value=0, maxlen=window_size-1, dtype='int32')
+seqc = pad_sequences(seqc, value=0, maxlen=window_size-1, dtype='int32')
+seqn = pad_sequences(seqn, value=0, maxlen=window_size-1, dtype='float32')
+seqn = np.expand_dims(seqn, axis=2)
+seq, seqc, seqn, pos = seq[:,-max_len:], seqc[:,-max_len:], seqn[:,-max_len:], pos[:,-max_len:]
 
 def random_neq(seq, vocab):
     """Choose a random element that is not in the sequence."""
@@ -71,35 +87,19 @@ for row in seq:
     neg.append(lst)
 neg = np.array(neg)
 
-
-def seq_to_window(arr, window_size):
-    """Converts variable length category sequence to fixed size.  """
-    seq = []
-    for i, row in enumerate(arr):
-        if (len(row) <= window_size) and (len(row) > 2):
-            seq.append(row[:-2])
-    return seq
-
-
-seqc = seq_to_window(inpc.values.tolist(), window_size=window_size)
-seqc = pad_sequences(seqc, value=0, maxlen=window_size-1, dtype='int32')
-seqn = seq_to_window(inpf.values.tolist(), window_size=window_size)
-seqn = pad_sequences(seqn, value=0, maxlen=window_size-1, dtype='float32')
-seqn = np.expand_dims(seqn, axis=2)
-
-
 ## --------------------------------Modelling------------------------------------
+
 class TransformerModel(nn.Module):
-    def __init__(self, vocab, embed_dim, maxlen, n_blocks=10, dropout=0.2):
+    def __init__(self, vocab, embed_dim, max_len, n_blocks=10, dropout=0.2):
         super(TransformerModel, self).__init__()
         
         self.encoder = nn.Embedding(vocab, embed_dim, padding_idx=0)
         self.cat_encoder = nn.Embedding(vocab_cat, embed_dim, padding_idx=0)
         self.weights = nn.Parameter(torch.rand(embed_dim, (2*embed_dim)+1), requires_grad=True)
         self.embed_dim = embed_dim
-        
+        # self.gated_fusion = GatedFusion(embedding_dim, num_embeddings)
         self.decoder = nn.Linear(2*embed_dim, embed_dim)
-        self.pos_emb = torch.nn.Embedding(maxlen, embed_dim)
+        self.pos_emb = torch.nn.Embedding(max_len, embed_dim)
         self.encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=n_head)
         self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=n_layer)
                    
@@ -110,6 +110,7 @@ class TransformerModel(nn.Module):
         weights_normalized = nn.functional.softmax(self.weights, dim=-1)
         out = torch.matmul(torch.cat((args), dim=-1), weights_normalized.t())
         return out
+    
     
     def log2feats(self, x, xc, xn):        
         seq = self.encoder(x) * math.sqrt(self.embed_dim)
@@ -159,10 +160,7 @@ class TransformerModel(nn.Module):
         pos_embs = self.encoder(y_pos)
         neg_embs = self.encoder(y_neg)
         
-        pos_logits = (log_feats * pos_embs).sum(dim=-1)
-        neg_logits = (log_feats * neg_embs).sum(dim=-1)
-
-        return pos_logits, neg_logits
+        return log_feats, pos_embs, neg_embs
 
     def predict(self, x, item_indices, xc, xn):
         """Given a sequence of items, item category and price, predict a score for candidate items.
@@ -185,10 +183,11 @@ class TransformerModel(nn.Module):
 
 
 model = TransformerModel(vocab=vocab, embed_dim=embed_dim, 
-                             maxlen=window_size-1, n_blocks=2, dropout=dropout)
+                             max_len=max_len, n_blocks=2, dropout=dropout)
 
-bce_criterion = torch.nn.BCEWithLogitsLoss() 
+triplet_loss = nn.TripletMarginLoss(margin=1.0, p=2)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.98))
+
 
 # Pytorch train data loader
 class SeqDataset(Dataset):
@@ -214,22 +213,15 @@ train_loader = DataLoader(dataset = dataset, batch_size = batch_size, shuffle=Tr
 model.train()
 total_loss=0
 for epoch in range(epochs):
-    for seq_, pos_, neg_, seqc_, seqn_ in train_loader:        
+    for seq, pos, neg, seqc, seqn in tqdm(train_loader):        
              
-        pos_logits, neg_logits = model(seq_, pos_, neg_, seqc_, seqn_)        
-        pos_labels, neg_labels = torch.ones(pos_logits.shape), torch.zeros(neg_logits.shape)
-        
-        indices = torch.where(pos_ != 0)
-        optimizer.zero_grad()
-        
-        loss = bce_criterion(pos_logits[indices], pos_labels[indices])
-        loss += bce_criterion(neg_logits[indices], neg_labels[indices])
+        anchor_emb, pos_emb, neg_emb = model(seq, pos, neg, seqc, seqn)
+        loss = triplet_loss(anchor_emb, pos_emb, neg_emb)
         
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
     print(epoch, loss)
-
 
 dataset = SeqDataset(seq, pos, test, seqc, seqn)
 test_loader = DataLoader(dataset = dataset, batch_size = 1, shuffle=True)
@@ -241,7 +233,7 @@ for _ in range(10):
     valid_user = 0.0
     z=0
     
-    for seq_, pos_, test_, seqc_, seqn_ in test_loader:
+    for seq_, pos_, test_, seqc_, seqn_ in tqdm(test_loader):
 
         item_idx = test_.tolist()
         for _ in range(100):        
