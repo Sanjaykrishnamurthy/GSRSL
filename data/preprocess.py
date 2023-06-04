@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 # We are not using train-queries.csv and test-queries.csv. Instead we will use the other 4 datasets and merge it together.
-# train-item-views.csv is the clicks 
+# train-item-views.csv is the clicks. 
 # train-purchases.csv is the buys and we merge both
 # then we merge the result with product-categories.csv and products.csv to get category and price column.
 
